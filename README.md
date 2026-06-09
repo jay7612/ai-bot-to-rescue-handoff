@@ -35,7 +35,7 @@ Built as a working reference for the **Nexthink Spark + GoTo Rescue** integratio
 
 A 2-minute walkthrough showing a real failure mode (corporate-blocked internal portal) being handled end-to-end:
 
-📹 [Watch the demo](docs/demo-video-link.md) *(replace with your video link)*
+📹 [Watch the demo](docs/demo-video-link.mp4) *(replace with your video link)*
 
 | Stage | What the user sees |
 |---|---|
