@@ -126,8 +126,6 @@ This is Phase 2 of an internal integration project.
 - **Phase 1** (2025): Rescue reachable from Spark on specific KBs. Each new failure scenario required a new KB authored explicitly to trigger the escalation.
 - **Phase 2** (2026): Rescue as the default fallback for *any* failed bot self-heal, with AI-summarized context preserved through the handoff. Bot-agnostic.
 
-Phase 3 ideas — multi-bot adapter layer, internal LLM gateway support, proper observability — see [`docs/roadmap.md`](docs/roadmap.md).
-
 ## What this is and isn't
 
 **This is:** a working reference implementation. It's running successfully end-to-end on commodity hardware. You can clone it, plug in your credentials, and have a working integration in an afternoon.
