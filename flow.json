@@ -1,0 +1,427 @@
+[
+    {
+        "id": "412938f5f48be9d3",
+        "type": "tab",
+        "label": "NT Phase 3",
+        "disabled": false,
+        "info": "Phase 2 + Device UID lookup: Spark → Node-RED → AI Summary → Resolve UID via NQL → Nexthink Remote Action (Rescue Calling Card)\n\nPipeline:\n1. Spark POSTs escalation to /nexthink/rescue\n2. Extract payload (cmdb_ci as DEVICE NAME, caller_id, description, work_notes, etc.)\n3. Respond 200 to Spark immediately with ticketId + ticketNumber\n4. Validate input\n5. Send description + work_notes to OpenAI for summarization (<=500 chars)\n6. Get Nexthink auth token\n7. Resolve device NAME → collector.uid via NQL\n8. Trigger remote action #escalate_spark_to_rescue_remote with the summary\n9. Log response\n\nEnv vars expected:\n  OPENAI_API_KEY                    - OpenAI API key\n  OPENAI_MODEL                      - optional, defaults to gpt-5.4-mini\n  NEXTHINK_REMOTE_ACTION_ID         - optional, defaults to #escalate_spark_to_rescue_remote\n  NEXTHINK_NQL_DEVICE_LOOKUP_ID     - optional, defaults to #resolve_device_uid_by_name",
+        "env": []
+    },
+    {
+        "id": "b07154c720ad96f0",
+        "type": "http in",
+        "z": "412938f5f48be9d3",
+        "name": "Nexthink/AI Bot Listener",
+        "url": "/nexthink/rescue",
+        "method": "post",
+        "upload": false,
+        "skipBodyParsing": false,
+        "swaggerDoc": "",
+        "x": 130,
+        "y": 100,
+        "wires": [
+            [
+                "04355630f2e427c0"
+            ]
+        ]
+    },
+    {
+        "id": "04355630f2e427c0",
+        "type": "function",
+        "z": "412938f5f48be9d3",
+        "name": "Extract Payload",
+        "func": "// Spark sends the escalation payload here\nvar data = msg.payload;\n\nnode.log('Incoming Spark payload: ' + JSON.stringify(data));\n\n// Pull fields out for downstream use\nmsg.deviceName  = data.cmdb_ci;        // arrives as device NAME, not UUID\nmsg.callerId    = data.caller_id;\nmsg.shortDesc   = data.short_description;\nmsg.description = data.description;\nmsg.workNotes   = data.work_notes;\nmsg.category    = data.category;\nmsg.subcategory = data.subcategory;\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 340,
+        "y": 140,
+        "wires": [
+            [
+                "2026104eb5abca21",
+                "c54be90543712833"
+            ]
+        ]
+    },
+    {
+        "id": "2026104eb5abca21",
+        "type": "function",
+        "z": "412938f5f48be9d3",
+        "name": "Build Ack",
+        "func": "// Spark expects ticketId + ticketNumber in the response so it can show the\n// user a reference and mark the conversation as escalated. We generate our\n// own values - no real ticket is created behind the scenes.\n\nconst now = Date.now();\nconst shortId = now.toString(36).toUpperCase();\nconst ticketNumber = 'has been created and a Rescue Remote Agent would be with you shortly, here is the ticket number-' + shortId;\nconst ticketId = 'rescue-' + now + '-' + Math.random().toString(36).substring(2, 10);\n\nmsg.rescueTicketId = ticketId;\nmsg.rescueTicketNumber = ticketNumber;\n\nmsg.payload = {\n    ticketId: ticketId,\n    ticketNumber: ticketNumber,\n    status: 'accepted',\n    message: 'Rescue session triggered',\n    receivedAt: new Date().toISOString()\n};\nmsg.statusCode = 200;\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 560,
+        "y": 80,
+        "wires": [
+            [
+                "02be7574e1ed208f"
+            ]
+        ]
+    },
+    {
+        "id": "02be7574e1ed208f",
+        "type": "http response",
+        "z": "412938f5f48be9d3",
+        "name": "200 OK",
+        "statusCode": "",
+        "headers": {},
+        "x": 740,
+        "y": 80,
+        "wires": []
+    },
+    {
+        "id": "c54be90543712833",
+        "type": "function",
+        "z": "412938f5f48be9d3",
+        "name": "Validate Input",
+        "func": "if (!msg.deviceName) {\n    node.error('Missing cmdb_ci in Spark payload - cannot trigger rescue', msg);\n    return null;\n}\n\nif (!msg.description && !msg.shortDesc && !msg.workNotes) {\n    node.warn('No description / short_description / work_notes in payload - AI summary will use placeholder');\n}\n\nnode.log('Processing rescue for device name: ' + msg.deviceName);\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 560,
+        "y": 200,
+        "wires": [
+            [
+                "4ff51a44ee983962"
+            ]
+        ]
+    },
+    {
+        "id": "4ff51a44ee983962",
+        "type": "function",
+        "z": "412938f5f48be9d3",
+        "name": "Build AI Request",
+        "func": "// Combine description + work_notes for richer AI context.\n// Description = user problem; work_notes = troubleshooting history.\nconst parts = [];\nif (msg.description) parts.push('ISSUE:\\n' + msg.description);\nif (msg.workNotes)   parts.push('TROUBLESHOOTING ALREADY ATTEMPTED:\\n' + msg.workNotes);\n\nconst conversation = parts.length > 0\n    ? parts.join('\\n\\n')\n    : (msg.shortDesc || '');\n\n// Stash for fallback if AI call fails\nmsg.rawConversation = conversation;\n\nif (!conversation || conversation.trim().length === 0) {\n    msg.summary = 'Spark escalation - no conversation context provided';\n    msg.skipAI = true;\n    return msg;\n}\n\nif (conversation.length <= 500) {\n    msg.summary = conversation;\n    msg.skipAI = true;\n    node.log('Conversation already <= 500 chars, skipping AI');\n    return msg;\n}\n\nconst apiKey = env.get('OPENAI_API_KEY');\nif (!apiKey) {\n    node.error('OPENAI_API_KEY env var not set', msg);\n    return null;\n}\n\nconst model = env.get('OPENAI_MODEL') || 'gpt-5.4-mini';\n\nconst instructions = 'You are summarizing an IT support escalation. The input has two labeled sections: ISSUE (what the user reports) and TROUBLESHOOTING ALREADY ATTEMPTED (what the AI assistant tried before escalating). Produce a single-paragraph summary STRICTLY UNDER 450 CHARACTERS for a human technician about to take over. It MUST capture: (1) what is broken, (2) what has already been ruled out, (3) the most likely remaining cause if mentioned. Skip pleasantries, names, timestamps, and preamble. Output ONLY the summary text.';\n\nmsg.url = 'https://api.openai.com/v1/responses';\nmsg.method = 'POST';\nmsg.headers = {\n    'Authorization': 'Bearer ' + apiKey,\n    'Content-Type': 'application/json'\n};\nmsg.payload = {\n    model: model,\n    instructions: instructions,\n    input: conversation\n};\n\nmsg.skipAI = false;\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 760,
+        "y": 200,
+        "wires": [
+            [
+                "c59a81eff82c12d5"
+            ]
+        ]
+    },
+    {
+        "id": "c59a81eff82c12d5",
+        "type": "switch",
+        "z": "412938f5f48be9d3",
+        "name": "Skip AI?",
+        "property": "skipAI",
+        "propertyType": "msg",
+        "rules": [
+            {
+                "t": "true"
+            },
+            {
+                "t": "else"
+            }
+        ],
+        "checkall": "false",
+        "repair": false,
+        "outputs": 2,
+        "x": 960,
+        "y": 200,
+        "wires": [
+            [
+                "efb67c2b466afac8"
+            ],
+            [
+                "b4ba9fe32e3fcf84"
+            ]
+        ]
+    },
+    {
+        "id": "b4ba9fe32e3fcf84",
+        "type": "http request",
+        "z": "412938f5f48be9d3",
+        "name": "Call OpenAI",
+        "method": "use",
+        "ret": "txt",
+        "paytoqs": "ignore",
+        "url": "",
+        "tls": "",
+        "persist": false,
+        "proxy": "",
+        "insecureHTTPParser": false,
+        "authType": "",
+        "senderr": true,
+        "headers": [],
+        "x": 1140,
+        "y": 260,
+        "wires": [
+            [
+                "21e0a80708862b54"
+            ]
+        ]
+    },
+    {
+        "id": "21e0a80708862b54",
+        "type": "function",
+        "z": "412938f5f48be9d3",
+        "name": "Parse Summary",
+        "func": "function fallback(reason) {\n    node.warn('AI summary failed (' + reason + '), falling back to truncated raw text');\n    const fallbackText = (msg.rawConversation || 'Spark escalation - see ticket for details').substring(0, 500);\n    msg.summary = fallbackText;\n    return msg;\n}\n\nif (msg.statusCode && msg.statusCode >= 400) {\n    return fallback('HTTP ' + msg.statusCode + ': ' + (typeof msg.payload === 'string' ? msg.payload.substring(0, 200) : JSON.stringify(msg.payload).substring(0, 200)));\n}\n\nlet body;\ntry {\n    body = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload;\n} catch (e) {\n    return fallback('JSON parse error: ' + e.message);\n}\n\nlet summary = null;\n\nif (body.output_text && typeof body.output_text === 'string') {\n    summary = body.output_text;\n}\n\nif (!summary && Array.isArray(body.output)) {\n    for (const item of body.output) {\n        if (item.type === 'message' && Array.isArray(item.content)) {\n            for (const c of item.content) {\n                if (c.type === 'output_text' && c.text) {\n                    summary = c.text;\n                    break;\n                }\n            }\n        }\n        if (summary) break;\n    }\n}\n\nif (!summary) {\n    return fallback('No summary text found in response: ' + JSON.stringify(body).substring(0, 300));\n}\n\nsummary = summary.trim();\n\nif (summary.length > 500) {\n    node.warn('AI returned ' + summary.length + ' chars, truncating to 500');\n    summary = summary.substring(0, 500);\n}\n\nmsg.summary = summary;\nnode.log('AI summary (' + summary.length + ' chars): ' + summary);\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1340,
+        "y": 260,
+        "wires": [
+            [
+                "efb67c2b466afac8"
+            ]
+        ]
+    },
+    {
+        "id": "efb67c2b466afac8",
+        "type": "http request",
+        "z": "412938f5f48be9d3",
+        "name": "Get Auth Token",
+        "method": "POST",
+        "ret": "txt",
+        "paytoqs": "ignore",
+        "url": "https://<your-tenant>.api.<region>.nexthink.cloud/api/v1/token",
+        "tls": "",
+        "persist": false,
+        "proxy": "",
+        "insecureHTTPParser": false,
+        "authType": "",
+        "senderr": false,
+        "headers": [
+            {
+                "keyType": "other",
+                "keyValue": "Content-Type",
+                "valueType": "other",
+                "valueValue": "application/x-www-form-urlencoded"
+            },
+            {
+                "keyType": "other",
+                "keyValue": "Authorization",
+                "valueType": "other",
+                "valueValue": "Basic <base64-encoded-client_id:client_secret>"
+            }
+        ],
+        "x": 240,
+        "y": 380,
+        "wires": [
+            [
+                "558ca78adcb57d84"
+            ]
+        ]
+    },
+    {
+        "id": "558ca78adcb57d84",
+        "type": "function",
+        "z": "412938f5f48be9d3",
+        "name": "Extract Token",
+        "func": "const body = JSON.parse(msg.payload);\n\nif (!body.access_token) {\n    node.error('No access_token in response', msg);\n    return null;\n}\n\nnode.log('Token received: ' + body.access_token.substring(0, 20) + '...');\n\nmsg.token = body.access_token;\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 440,
+        "y": 380,
+        "wires": [
+            [
+                "f326f43e51dc8a4a"
+            ]
+        ]
+    },
+    {
+        "id": "f326f43e51dc8a4a",
+        "type": "function",
+        "z": "412938f5f48be9d3",
+        "name": "Build NQL Request",
+        "func": "// Resolve the device name from Spark into Nexthink's collector.uid (UUID)\n// before triggering the remote action.\n\nif (!msg.deviceName) {\n    node.error('Cannot resolve UID - msg.deviceName is empty', msg);\n    return null;\n}\n\n// Stash the original hostname so we can log it later if useful\nmsg.deviceHostname = msg.deviceName;\n\nconst nqlQueryId = env.get('NEXTHINK_NQL_DEVICE_LOOKUP_ID') || '#resolve_device_uid_by_name';\n\nmsg.url = 'https://<your-tenant>.api.<region>.nexthink.cloud/api/v2/nql/execute';\nmsg.method = 'POST';\nmsg.headers = {\n    'Authorization': 'Bearer ' + msg.token,\n    'Content-Type': 'application/json',\n    'Accept': 'application/json'\n};\nmsg.payload = {\n    queryId: nqlQueryId,\n    parameters: {\n        param0: msg.deviceHostname\n    }\n};\n\nnode.log('Looking up Nexthink UID for device name: ' + msg.deviceHostname);\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 660,
+        "y": 380,
+        "wires": [
+            [
+                "0f363f67ba45e074"
+            ]
+        ]
+    },
+    {
+        "id": "0f363f67ba45e074",
+        "type": "http request",
+        "z": "412938f5f48be9d3",
+        "name": "Call NQL",
+        "method": "use",
+        "ret": "txt",
+        "paytoqs": "ignore",
+        "url": "",
+        "tls": "",
+        "persist": false,
+        "proxy": "",
+        "insecureHTTPParser": false,
+        "authType": "",
+        "senderr": true,
+        "headers": [],
+        "x": 860,
+        "y": 380,
+        "wires": [
+            [
+                "a14a1af3812531b8"
+            ]
+        ]
+    },
+    {
+        "id": "a14a1af3812531b8",
+        "type": "function",
+        "z": "412938f5f48be9d3",
+        "name": "Parse UID",
+        "func": "// Extract device.collector.uid from the NQL response.\n// V2 shape per Nexthink docs:\n//   { queryId, executedQuery, rows: <count>, data: [ { \"device.collector.uid\": \"...\" } ] }\n\nif (msg.statusCode && msg.statusCode >= 400) {\n    node.error('NQL lookup failed: HTTP ' + msg.statusCode + ' - ' + (typeof msg.payload === 'string' ? msg.payload.substring(0, 300) : JSON.stringify(msg.payload).substring(0, 300)), msg);\n    return null;\n}\n\nlet body;\ntry {\n    body = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload;\n} catch (e) {\n    node.error('Failed to parse NQL response: ' + e.message, msg);\n    return null;\n}\n\nif (!Array.isArray(body.data) || body.data.length === 0) {\n    node.error('No data rows for device \"' + msg.deviceHostname + '\". NQL response: ' + JSON.stringify(body).substring(0, 300), msg);\n    return null;\n}\n\nconst uid = body.data[0]['device.collector.uid'];\n\nif (!uid) {\n    node.error('device.collector.uid missing in row for \"' + msg.deviceHostname + '\". Row: ' + JSON.stringify(body.data[0]), msg);\n    return null;\n}\n\nnode.log('Resolved ' + msg.deviceHostname + ' → ' + uid);\n\n// Overwrite deviceName with the UUID so Build Execute Payload uses the right value\nmsg.deviceName = uid;\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1060,
+        "y": 380,
+        "wires": [
+            [
+                "bfbe93e7ece3ece5"
+            ]
+        ]
+    },
+    {
+        "id": "bfbe93e7ece3ece5",
+        "type": "function",
+        "z": "412938f5f48be9d3",
+        "name": "Build Execute Payload",
+        "func": "msg.headers = {\n    'Authorization': 'Bearer ' + msg.token,\n    'Content-Type': 'application/json',\n    'Accept': '*/*'\n};\n\nconst reason = msg.shortDesc\n    ? `Spark escalation: ${msg.shortDesc}`\n    : 'Spark escalation - Launching Rescue Session';\n\nconst externalRef = msg.callerId\n    ? `SPARK-${msg.callerId}`\n    : 'SPARK-UNKNOWN';\n\nconst remoteActionId = env.get('NEXTHINK_REMOTE_ACTION_ID') || '#escalate_spark_to_rescue_remote';\n\nmsg.payload = {\n    remoteActionId: remoteActionId,\n    devices: [msg.deviceName],   // <-- now contains the resolved UUID\n    expiresInMinutes: 60,\n    triggerInfo: {\n        externalSource: 'Node-RED',\n        reason: reason,\n        externalReference: externalRef\n    },\n    params: {\n        IssueSummary: msg.summary || 'Spark escalation - see ticket for details'\n    }\n};\n\nnode.log('Executing ' + remoteActionId + ' on UID ' + msg.deviceName + ' (hostname: ' + (msg.deviceHostname || 'unknown') + ') with summary: ' + (msg.summary || '').substring(0, 80) + '...');\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 360,
+        "y": 500,
+        "wires": [
+            [
+                "9cc1711d8de1e3a1"
+            ]
+        ]
+    },
+    {
+        "id": "9cc1711d8de1e3a1",
+        "type": "http request",
+        "z": "412938f5f48be9d3",
+        "name": "Execute Remote Action",
+        "method": "POST",
+        "ret": "txt",
+        "paytoqs": "ignore",
+        "url": "https://<your-tenant>.api.<region>.nexthink.cloud/api/v1/act/execute",
+        "tls": "",
+        "persist": false,
+        "proxy": "",
+        "insecureHTTPParser": false,
+        "authType": "",
+        "senderr": false,
+        "headers": [],
+        "x": 600,
+        "y": 500,
+        "wires": [
+            [
+                "db01d0a6d9c0c46d"
+            ]
+        ]
+    },
+    {
+        "id": "db01d0a6d9c0c46d",
+        "type": "function",
+        "z": "412938f5f48be9d3",
+        "name": "Handle Response",
+        "func": "try {\n    const body = JSON.parse(msg.payload);\n    if (body.requestId) {\n        node.log('Rescue triggered. Nexthink requestId: ' + body.requestId);\n        msg.rescueRequestId = body.requestId;\n    } else {\n        node.warn('Unexpected execute response: ' + msg.payload);\n    }\n} catch (e) {\n    node.error('Failed to parse execute response: ' + msg.payload, msg);\n    return null;\n}\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 840,
+        "y": 500,
+        "wires": [
+            [
+                "635813143d9b8cc2"
+            ]
+        ]
+    },
+    {
+        "id": "635813143d9b8cc2",
+        "type": "debug",
+        "z": "412938f5f48be9d3",
+        "name": "Execute Response",
+        "active": true,
+        "tosidebar": true,
+        "console": true,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1070,
+        "y": 500,
+        "wires": []
+    },
+    {
+        "id": "fc0189b374b7e70c",
+        "type": "catch",
+        "z": "412938f5f48be9d3",
+        "name": "Catch Errors",
+        "scope": null,
+        "uncaught": false,
+        "x": 360,
+        "y": 620,
+        "wires": [
+            [
+                "16fa41e6494a4940"
+            ]
+        ]
+    },
+    {
+        "id": "16fa41e6494a4940",
+        "type": "debug",
+        "z": "412938f5f48be9d3",
+        "name": "Flow Errors",
+        "active": true,
+        "tosidebar": true,
+        "console": true,
+        "tostatus": true,
+        "complete": "true",
+        "targetType": "full",
+        "statusVal": "payload",
+        "statusType": "auto",
+        "x": 560,
+        "y": 620,
+        "wires": []
+    }
+]
